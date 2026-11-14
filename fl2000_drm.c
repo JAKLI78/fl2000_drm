@@ -97,6 +97,8 @@ struct fl2000_drm_if {
 	struct drm_simple_display_pipe pipe;
 	struct fl2000_stream *stream;
 	struct fl2000_intr *intr;
+	struct notifier_block pm_nb;
+	bool suspended; /* display state saved by the PM notifier */
 };
 
 DEFINE_DRM_GEM_FOPS(fl2000_drm_driver_fops);
@@ -451,6 +453,12 @@ static void fl2000_drm_if_release(struct device *dev, void *res)
 
 	dev_info(master, "Unbinding FL2000 master");
 
+	unregister_pm_notifier(&drm_if->pm_nb);
+	if (drm_if->suspended) {
+		drm_atomic_state_put(drm->mode_config.suspend_state);
+		drm->mode_config.suspend_state = NULL;
+	}
+
 	/* Stop userspace access and turn the display off while bridge, stream and interrupts are
 	 * still alive: disabling the pipe uses all of them
 	 */
@@ -469,6 +477,77 @@ static void fl2000_drm_if_release(struct device *dev, void *res)
 
 	/* Final release happens once userspace closes it */
 	drm_dev_put(drm);
+}
+
+static struct fl2000_drm_if *fl2000_drm_if_get(struct usb_device *usb_dev)
+{
+	struct fl2000_drm_if **res = devres_find(&usb_dev->dev, fl2000_drm_if_release, NULL, NULL);
+
+	return res ? *res : NULL;
+}
+
+/* The display scans out buffers shared by another GPU (PRIME), which is suspended in parallel with
+ * this USB device. Turn the display off before any device suspends and restore it after all have
+ * resumed, so the exporting GPU is awake whenever the shared buffer is touched
+ */
+static int fl2000_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	int ret;
+	struct fl2000_drm_if *drm_if = container_of(nb, struct fl2000_drm_if, pm_nb);
+	struct drm_device *drm = drm_if->drm;
+
+	UNUSED(data);
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+		ret = drm_mode_config_helper_suspend(drm);
+		if (ret)
+			dev_err(drm->dev, "Cannot suspend display (%d)", ret);
+		else
+			drm_if->suspended = true;
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+		/* Not set if the device was rebound during resume: the new one is not suspended */
+		if (drm_if->suspended) {
+			drm_if->suspended = false;
+			ret = drm_mode_config_helper_resume(drm);
+			if (ret)
+				dev_err(drm->dev, "Cannot resume display (%d)", ret);
+		}
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+/* Interrupt transfers stop while the USB device sleeps. Nothing to do if the DRM device was never
+ * bound (e.g. no bridge found)
+ */
+int fl2000_drm_suspend(struct usb_device *usb_dev)
+{
+	struct fl2000_drm_if *drm_if = fl2000_drm_if_get(usb_dev);
+
+	if (drm_if)
+		fl2000_intr_suspend(drm_if->intr);
+
+	return 0;
+}
+
+int fl2000_drm_resume(struct usb_device *usb_dev)
+{
+	int ret;
+	struct fl2000_drm_if *drm_if = fl2000_drm_if_get(usb_dev);
+
+	if (!drm_if)
+		return 0;
+
+	ret = fl2000_intr_resume(drm_if->intr);
+	if (ret)
+		dev_err(&usb_dev->dev, "Cannot restart interrupts (%d)", ret);
+
+	return 0;
 }
 
 /* TODO: release on errors! */
@@ -575,6 +654,9 @@ int fl2000_drm_bind(struct device *master)
 	fl2000_usb_magic(usb_dev);
 
 	drm_fbdev_generic_setup(drm, FL2000_FB_BPP);
+
+	drm_if->pm_nb.notifier_call = fl2000_drm_pm_notify;
+	register_pm_notifier(&drm_if->pm_nb);
 
 	/* From here on unbind (fl2000_drm_unbind) tears everything down */
 	devres_add(&usb_dev->dev, drm_if_res);

@@ -30,6 +30,7 @@ struct it66121_priv {
 
 	struct delayed_work work;
 	struct workqueue_struct *work_queue;
+	bool polling; /* HPD polling runs between bridge attach and component unbind */
 
 	struct regmap_field *irq_pending;
 	struct regmap_field *hpd;
@@ -499,6 +500,7 @@ static void it66121_unbind(struct device *comp, struct device *master, void *mas
 	dev_info(comp, "Unbinding IT66121 component");
 
 	/* Polling uses the DRM device, which is being torn down */
+	priv->polling = false;
 	cancel_delayed_work_sync(&priv->work);
 }
 
@@ -582,6 +584,7 @@ static int it66121_bridge_attach(struct drm_bridge *bridge, enum drm_bridge_atta
 
 	/* Start interrupts */
 	regmap_write_bits(priv->regmap, IT66121_INT_MASK_1, IT66121_MASK_DDC, 0);
+	priv->polling = true;
 	queue_delayed_work(priv->work_queue, &priv->work, msecs_to_jiffies(IRQ_POLL_INTRVL));
 
 	dev_info(bridge->dev->dev, "Bridge attached");
@@ -899,6 +902,30 @@ static void it66121_remove(struct i2c_client *client)
 	kref_put(&priv->ref, it66121_release);
 }
 
+/* Polling stops on its first failed transfer, so pause it while the USB device sleeps */
+static int it66121_suspend(struct device *dev)
+{
+	struct drm_bridge *bridge = dev_get_drvdata(dev);
+	struct it66121_priv *priv = container_of(bridge, struct it66121_priv, bridge);
+
+	cancel_delayed_work_sync(&priv->work);
+
+	return 0;
+}
+
+static int it66121_resume(struct device *dev)
+{
+	struct drm_bridge *bridge = dev_get_drvdata(dev);
+	struct it66121_priv *priv = container_of(bridge, struct it66121_priv, bridge);
+
+	if (priv->polling)
+		queue_delayed_work(priv->work_queue, &priv->work, msecs_to_jiffies(IRQ_POLL_INTRVL));
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(it66121_pm_ops, it66121_suspend, it66121_resume);
+
 static const struct i2c_device_id it66121_id[] = {
 	{ "it66121", 0 },
 	{}
@@ -908,6 +935,7 @@ MODULE_DEVICE_TABLE(i2c, it66121_id);
 static struct i2c_driver it66121_driver = {
 	.driver = {
 		.name = "it66121",
+		.pm = pm_sleep_ptr(&it66121_pm_ops),
 	},
 	.probe = it66121_probe,
 	.remove = it66121_remove,

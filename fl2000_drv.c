@@ -185,32 +185,27 @@ static void fl2000_disconnect(struct usb_interface *interface)
 	}
 }
 
+/* All interfaces belong to one display; handle it once, on the AV control interface. The USB
+ * device stays active until all its interfaces are suspended. Without power loss the state is
+ * restored on resume; if the device was reset during sleep, the USB core rebinds the driver
+ * instead (there is no reset_resume), the same as an unplug and replug
+ */
 static int fl2000_suspend(struct usb_interface *interface, pm_message_t message)
 {
-	struct usb_device *usb_dev = interface_to_usbdev(interface);
-
 	UNUSED(message);
 
-	dev_dbg(&usb_dev->dev, "resume");
+	if (interface->cur_altsetting->desc.bInterfaceNumber != FL2000_USBIF_AVCONTROL)
+		return 0;
 
-	/* TODO: suspend
-	 * drm_mode_config_helper_suspend()
-	 */
-
-	return 0;
+	return fl2000_drm_suspend(interface_to_usbdev(interface));
 }
 
 static int fl2000_resume(struct usb_interface *interface)
 {
-	struct usb_device *usb_dev = interface_to_usbdev(interface);
+	if (interface->cur_altsetting->desc.bInterfaceNumber != FL2000_USBIF_AVCONTROL)
+		return 0;
 
-	dev_dbg(&usb_dev->dev, "suspend");
-
-	/* TODO: resume
-	 * drm_mode_config_helper_resume()
-	 */
-
-	return 0;
+	return fl2000_drm_resume(interface_to_usbdev(interface));
 }
 
 static struct usb_driver fl2000_driver = {

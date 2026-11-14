@@ -136,6 +136,19 @@ struct fl2000_intr *fl2000_intr_create(struct usb_device *usb_dev, struct drm_de
 	return intr;
 }
 
+/* Poison first so the work cannot resubmit the URB while being cancelled */
+void fl2000_intr_suspend(struct fl2000_intr *intr)
+{
+	usb_poison_urb(intr->urb);
+	cancel_work_sync(&intr->work);
+}
+
+int fl2000_intr_resume(struct fl2000_intr *intr)
+{
+	usb_unpoison_urb(intr->urb);
+	return usb_submit_urb(intr->urb, GFP_NOIO);
+}
+
 void fl2000_intr_destroy(struct usb_device *usb_dev)
 {
 	devres_release(&usb_dev->dev, fl2000_intr_release, NULL, NULL);

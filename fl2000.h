@@ -34,7 +34,9 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
+#include <linux/suspend.h>
 #include <drm/drm_gem_atomic_helper.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_crtc_helper.h>
@@ -159,6 +161,8 @@ void fl2000_stream_disable(struct fl2000_stream *stream);
 struct fl2000_intr;
 struct fl2000_intr *fl2000_intr_create(struct usb_device *usb_dev, struct drm_device *drm);
 void fl2000_intr_destroy(struct usb_device *usb_dev);
+void fl2000_intr_suspend(struct fl2000_intr *intr);
+int fl2000_intr_resume(struct fl2000_intr *intr);
 
 /* I2C adapter interface creation */
 struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev);
@@ -181,5 +185,7 @@ int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset,
 /* DRM device creation */
 int fl2000_drm_bind(struct device *master);
 void fl2000_drm_unbind(struct device *master);
+int fl2000_drm_suspend(struct usb_device *usb_dev);
+int fl2000_drm_resume(struct usb_device *usb_dev);
 
 #endif /* __FL2000_DRM_H__ */
