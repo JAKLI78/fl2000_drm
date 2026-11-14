@@ -326,21 +326,17 @@ static void fb2000_dirty(struct drm_framebuffer *fb, const struct iosys_map *map
 	struct drm_device *drm = fb->dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
 
-	UNUSED(rect);
-
 	if (!drm_dev_enter(fb->dev, &idx)) {
 		dev_err(drm->dev, "DRM enter failed!");
 		return;
 	}
 
 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
-	if (ret)
-		return;
-
-	fl2000_stream_compress(drm_if->stream, map->vaddr, fb->height, fb->width,
-			       fb->pitches[0]);
-
-	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+	if (!ret) {
+		fl2000_stream_update(drm_if->stream, map->vaddr, fb->width, fb->height,
+				     fb->pitches[0], rect);
+		drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+	}
 
 	drm_dev_exit(idx);
 }
