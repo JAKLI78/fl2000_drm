@@ -91,7 +91,7 @@ static unsigned int fl2000_get_bytes_pix(enum usb_device_speed speed, unsigned i
 
 struct fl2000_drm_if {
 	struct usb_device *usb_dev;
-	struct device *master; /* component master (I2C adapter) */
+	struct device *master; /* component master (I2C adapter), not the DRM parent */
 	struct device *dma_dev;
 	struct drm_device *drm;
 	struct drm_simple_display_pipe pipe;
@@ -479,8 +479,12 @@ int fl2000_drm_bind(struct device *master)
 
 	dev_info(master, "Binding FL2000 master");
 
-	/* Not devm: the I2C adapter (master) has no driver, so unbind releases it explicitly */
-	drm = drm_dev_alloc(&fl2000_drm_driver, master);
+	/* Not devm: the I2C adapter (master) has no driver, so unbind releases it explicitly.
+	 * Parent is the USB interface, not the I2C adapter: a DRM device kept open by userspace
+	 * after unplug must not hold up adapter removal (i2c_del_adapter waits for all references)
+	 */
+	drm = drm_dev_alloc(&fl2000_drm_driver,
+			    &usb_ifnum_to_if(usb_dev, FL2000_USBIF_AVCONTROL)->dev);
 	if (IS_ERR(drm)) {
 		dev_err(master, "Cannot allocate DRM structure (%ld)", PTR_ERR(drm));
 		return (int)PTR_ERR(drm);

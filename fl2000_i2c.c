@@ -115,8 +115,24 @@ static void fl2000_i2c_adapter_release(struct device *dev, void *res)
 	i2c_del_adapter(adapter);
 }
 
+/* Any device answering a register read: the bridge driver verifies the chip ID itself */
+static int fl2000_i2c_probe_bridge(struct i2c_adapter *adapter, unsigned short addr)
+{
+	u8 reg = 0, val;
+	struct i2c_msg msgs[] = {
+		{ .addr = addr, .flags = 0, .len = 1, .buf = &reg },
+		{ .addr = addr, .flags = I2C_M_RD, .len = 1, .buf = &val },
+	};
+
+	return i2c_transfer(adapter, msgs, ARRAY_SIZE(msgs)) == ARRAY_SIZE(msgs);
+}
+
 struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev)
 {
+	/* IT66121 HDMI bridge: 0x98 or 0x9A in 8-bit notation */
+	static const unsigned short bridge_addrs[] = { 0x4C, 0x4D, I2C_CLIENT_END };
+	struct i2c_board_info bridge_info = { I2C_BOARD_INFO("it66121", 0) };
+	struct i2c_client *bridge;
 	int ret;
 	struct i2c_adapter *adapter;
 	u8 usb_path[32];
@@ -140,6 +156,11 @@ struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev)
 		devres_free(adapter);
 		return ERR_PTR(ret);
 	}
+
+	/* The client is removed together with the adapter; its driver module is loaded by alias */
+	bridge = i2c_new_scanned_device(adapter, &bridge_info, bridge_addrs, fl2000_i2c_probe_bridge);
+	if (IS_ERR(bridge))
+		dev_warn(&usb_dev->dev, "No HDMI bridge found on FL2000 I2C bus (%ld)", PTR_ERR(bridge));
 
 	usb_make_path(usb_dev, usb_path, sizeof(usb_path));
 	dev_dbg(&usb_dev->dev, "Created FL2000 bridge I2C bus %d at interface %s",
