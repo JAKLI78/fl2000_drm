@@ -242,10 +242,11 @@ static int fl2000_mode_calc(const struct drm_display_mode *mode,
 		return -1;
 
 	/* Try to match pixel clock slightly adjusting htotal value, sequence is:
-	   0, -1, 1, -2, 2, -3, 3, -3, 4, -4, 5, -5, ...
-	   Here, 's' is used for sign, 'm' is used for modulo, and 'd' is the adjustment value
+	 * 0, -1, 1, -2, 2, ..., -max_h_adjustment, max_h_adjustment
 	 */
-	for (int m = 0, s = 0, d = 0; m <= max_h_adjustment * 2; m++, s = -s, d += m * s) {
+	for (int i = 0; i <= max_h_adjustment * 2; i++) {
+		const int d = (i + 1) / 2 * ((i & 1) ? -1 : 1);
+
 		/* Maximum pixel clock 1GHz, or 10^9Hz. Multiply by 10^6 we get 10^15Hz. Assume
 		 * maximum htotal is 10000 pix (no way) we get 10^19 max value and using u64 which
 		 * is 1.8*10^19 no overflow can occur. Assume all this was checked before
