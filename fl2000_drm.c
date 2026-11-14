@@ -91,8 +91,9 @@ static unsigned int fl2000_get_bytes_pix(enum usb_device_speed speed, unsigned i
 
 struct fl2000_drm_if {
 	struct usb_device *usb_dev;
+	struct device *master; /* component master (I2C adapter) */
 	struct device *dma_dev;
-	struct drm_device drm;
+	struct drm_device *drm;
 	struct drm_simple_display_pipe pipe;
 	struct fl2000_stream *stream;
 	struct fl2000_intr *intr;
@@ -104,8 +105,6 @@ static void fl2000_drm_release(struct drm_device *drm)
 {
 	struct fl2000_drm_if *drm_if = drm->dev_private;
 
-	drm_atomic_helper_shutdown(drm);
-	drm_mode_config_cleanup(drm);
 	put_device(drm_if->dma_dev);
 }
 
@@ -438,16 +437,25 @@ static const struct drm_encoder_helper_funcs fl2000_encoder_funcs = {
 	.mode_set = fl2000_output_mode_set,
 };
 
+/* Registered on the USB device in bind, released from unbind (or on USB disconnect) */
 static void fl2000_drm_if_release(struct device *dev, void *res)
 {
-	struct fl2000_drm_if *drm_if = res;
-	struct drm_device *drm = &drm_if->drm;
+	struct fl2000_drm_if *drm_if = *(struct fl2000_drm_if **)res;
+	struct drm_device *drm = drm_if->drm;
+	struct device *master = drm_if->master;
 	struct usb_device *usb_dev = drm_if->usb_dev;
 
-	dev_info(dev, "Unbinding FL2000 master");
+	dev_info(master, "Unbinding FL2000 master");
+
+	/* Stop userspace access and turn the display off while bridge, stream and interrupts are
+	 * still alive: disabling the pipe uses all of them
+	 */
+	drm_kms_helper_poll_fini(drm);
+	drm_dev_unplug(drm);
+	drm_atomic_helper_shutdown(drm);
 
 	/* Detach bridge */
-	component_unbind_all(dev, drm);
+	component_unbind_all(master, &drm_if->pipe);
 
 	/* Start streaming interface */
 	fl2000_stream_destroy(usb_dev);
@@ -455,9 +463,7 @@ static void fl2000_drm_if_release(struct device *dev, void *res)
 	/* Start interrupts interface */
 	fl2000_intr_destroy(usb_dev);
 
-	/* Prepare to DRM device shutdown */
-	drm_kms_helper_poll_fini(drm);
-	drm_dev_unplug(drm);
+	/* Final release happens once userspace closes it */
 	drm_dev_put(drm);
 }
 
@@ -467,19 +473,34 @@ int fl2000_drm_bind(struct device *master)
 	int ret = 0;
 	struct usb_device *usb_dev = to_usb_device(master->parent);
 	struct fl2000_drm_if *drm_if;
+	struct fl2000_drm_if **drm_if_res;
 	struct drm_device *drm;
 	struct drm_mode_config *mode_config;
 
 	dev_info(master, "Binding FL2000 master");
 
-	drm_if = devm_drm_dev_alloc(master, &fl2000_drm_driver, struct fl2000_drm_if, drm);
-	if (IS_ERR(drm_if)) {
-		dev_err(master, "Cannot allocate DRM structure (%ld)", PTR_ERR(drm_if));
-		return (int)PTR_ERR(drm_if);
+	/* Not devm: the I2C adapter (master) has no driver, so unbind releases it explicitly */
+	drm = drm_dev_alloc(&fl2000_drm_driver, master);
+	if (IS_ERR(drm)) {
+		dev_err(master, "Cannot allocate DRM structure (%ld)", PTR_ERR(drm));
+		return (int)PTR_ERR(drm);
 	}
-	drm = &drm_if->drm;
+	drm_if = drmm_kzalloc(drm, sizeof(*drm_if), GFP_KERNEL);
+	if (!drm_if) {
+		drm_dev_put(drm);
+		return -ENOMEM;
+	}
+	drm_if->drm = drm;
+	drm_if->master = master;
 	drm_if->usb_dev = usb_dev;
 	drm->dev_private = drm_if;
+
+	drm_if_res = devres_alloc(fl2000_drm_if_release, sizeof(*drm_if_res), GFP_KERNEL);
+	if (!drm_if_res) {
+		drm_dev_put(drm);
+		return -ENOMEM;
+	}
+	*drm_if_res = drm_if;
 
 	ret = drmm_mode_config_init(drm);
 	if (ret) {
@@ -546,6 +567,9 @@ int fl2000_drm_bind(struct device *master)
 	fl2000_usb_magic(usb_dev);
 
 	drm_fbdev_generic_setup(drm, FL2000_FB_BPP);
+
+	/* From here on unbind (fl2000_drm_unbind) tears everything down */
+	devres_add(&usb_dev->dev, drm_if_res);
 
 	return 0;
 }

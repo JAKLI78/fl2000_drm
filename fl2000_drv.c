@@ -31,6 +31,7 @@ struct fl2000_devs {
 	struct i2c_adapter *adapter;
 	struct component_match *match;
 	int active_if;
+	void *group; /* devres group holding everything above, see fl2000_disconnect() */
 };
 
 static struct component_master_ops fl2000_master_ops = {
@@ -58,27 +59,48 @@ static int fl2000_compare(struct device *dev, void *data)
 	return 0;
 }
 
+/* Shared resources live on the USB device, which this driver does not bind to, so they are
+ * grouped and released explicitly when the last interface disconnects (e.g. on module unload)
+ */
 static struct fl2000_devs *fl2000_get_devices(struct usb_device *usb_dev)
 {
 	struct fl2000_devs *devs;
+	void *group;
+	int ret;
+
+	group = devres_open_group(&usb_dev->dev, NULL, GFP_KERNEL);
+	if (!group)
+		return ERR_PTR(-ENOMEM);
 
 	devs = devm_kzalloc(&usb_dev->dev, sizeof(*devs), GFP_KERNEL);
-	if (!devs)
-		return (ERR_PTR(-ENOMEM));
+	if (!devs) {
+		ret = -ENOMEM;
+		goto error;
+	}
+	devs->group = group;
 
 	devs->regmap = fl2000_regmap_init(usb_dev);
-	if (IS_ERR(devs->regmap))
-		return ERR_CAST(devs->regmap);
+	if (IS_ERR(devs->regmap)) {
+		ret = PTR_ERR(devs->regmap);
+		goto error;
+	}
 
 	devs->adapter = fl2000_i2c_init(usb_dev);
-	if (IS_ERR(devs->adapter))
-		return ERR_CAST(devs->adapter);
+	if (IS_ERR(devs->adapter)) {
+		ret = PTR_ERR(devs->adapter);
+		goto error;
+	}
 
 	component_match_add(&devs->adapter->dev, &devs->match, fl2000_compare, NULL);
 
+	devres_close_group(&usb_dev->dev, group);
 	dev_set_drvdata(&usb_dev->dev, devs);
 
 	return devs;
+
+error:
+	devres_release_group(&usb_dev->dev, group);
+	return ERR_PTR(ret);
 }
 
 /* TODO: Halt driver on initialization failure */
@@ -152,6 +174,14 @@ static void fl2000_disconnect(struct usb_interface *interface)
 	default: /* Device does not have any other interfaces */
 		dev_warn(&interface->dev, "What interface %d?", iface_num);
 		break;
+	}
+
+	/* Last interface gone: remove the I2C bus and free shared state */
+	if (!devs->active_if) {
+		void *group = devs->group;
+
+		dev_set_drvdata(&usb_dev->dev, NULL);
+		devres_release_group(&usb_dev->dev, group);
 	}
 }
 
