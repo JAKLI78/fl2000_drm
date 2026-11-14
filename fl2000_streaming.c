@@ -189,6 +189,34 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	usb_free_urb(urb);
 }
 
+#ifdef CONFIG_X86_64
+#include <asm/fpu/api.h>
+
+/* Vectorized conversion from fl2000_simd.c, if the CPU has SSSE3 and SSE4.1 */
+static bool fl2000_simd_usable(void)
+{
+	return boot_cpu_has(X86_FEATURE_SSSE3) && boot_cpu_has(X86_FEATURE_XMM4_1);
+}
+
+#define fl2000_simd_begin()	  kernel_fpu_begin()
+#define fl2000_simd_end()	  kernel_fpu_end()
+#define fl2000_simd_565(d, s, n, t) fl2000_simd_rgb565_line((u16 *)(d), s, n, t)
+#define fl2000_simd_888(d, s, n) fl2000_simd_rgb888_line(d, s, n)
+#else
+static bool fl2000_simd_usable(void)
+{
+	return false;
+}
+
+#define fl2000_simd_begin()	  do { } while (0)
+#define fl2000_simd_end()	  do { } while (0)
+#define fl2000_simd_565(d, s, n, t) do { } while (0)
+#define fl2000_simd_888(d, s, n) do { } while (0)
+#endif
+
+/* Lines converted per SIMD section: a 1080p line takes about a microsecond */
+#define FL2000_SIMD_LINES 64
+
 static void fl2000_xrgb888_to_rgb888_line(u8 *dbuf, u32 *sbuf, u32 pixels)
 {
 	unsigned int xx = 0;
@@ -296,19 +324,35 @@ static void fl2000_stream_fill(struct fl2000_stream *stream, struct fl2000_strea
 	/* Whole lines only: pixels are packed in swapped 8-byte groups */
 	src = stream->conv + (size_t)y1 * width;
 	dst = (u8 *)cur_sb->vaddr + (size_t)y1 * dst_line_len;
-	for (unsigned int y = y1; y < y2; y++) {
-		switch (stream->bytes_pix) {
-		case 2:
-			fl2000_xrgb888_to_rgb565_line((u16 *)dst, src, width, drow(y));
-			break;
-		case 3:
-			fl2000_xrgb888_to_rgb888_line(dst, src, width);
-			break;
-		default: /* Shouldn't happen */
-			break;
+	for (unsigned int y = y1; y < y2;) {
+		/* SIMD sections disable preemption: keep each one short */
+		unsigned int chunk_end = min(y2, y + FL2000_SIMD_LINES);
+		bool simd = fl2000_simd_usable();
+
+		if (simd)
+			fl2000_simd_begin();
+		for (; y < chunk_end; y++) {
+			switch (stream->bytes_pix) {
+			case 2:
+				if (simd)
+					fl2000_simd_565(dst, src, width, drow(y));
+				else
+					fl2000_xrgb888_to_rgb565_line((u16 *)dst, src, width, drow(y));
+				break;
+			case 3:
+				if (simd)
+					fl2000_simd_888(dst, src, width);
+				else
+					fl2000_xrgb888_to_rgb888_line(dst, src, width);
+				break;
+			default: /* Shouldn't happen */
+				break;
+			}
+			src += width;
+			dst += dst_line_len;
 		}
-		src += width;
-		dst += dst_line_len;
+		if (simd)
+			fl2000_simd_end();
 	}
 
 #undef drow

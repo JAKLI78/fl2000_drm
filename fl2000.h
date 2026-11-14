@@ -153,6 +153,11 @@ void fl2000_stream_destroy(struct usb_device *usb_dev);
 /* Streaming interface */
 int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_pix);
 struct drm_rect;
+#ifdef CONFIG_X86_64
+/* fl2000_simd.c: only between kernel_fpu_begin()/kernel_fpu_end() */
+void fl2000_simd_rgb565_line(u16 *dbuf, const u32 *sbuf, u32 pixels, const u32 *dither);
+void fl2000_simd_rgb888_line(u8 *dbuf, const u32 *sbuf, u32 pixels);
+#endif
 void fl2000_stream_update(struct fl2000_stream *stream, const void *src, unsigned int width,
 			  unsigned int height, unsigned int pitch, const struct drm_rect *rect);
 int fl2000_stream_enable(struct fl2000_stream *stream);

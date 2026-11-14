@@ -23,6 +23,8 @@ cd "$(dirname "$0")/.."
 mkdir -p "$src/bridge"
 cp dkms.conf Makefile LICENSE ./*.c ./*.h "$src/"
 cp bridge/*.c bridge/*.h "$src/bridge/"
+mkdir -p "$src/simd-include"
+cp simd-include/*.h "$src/simd-include/"
 rm -f "$src"/*.mod.c "$src"/bridge/*.mod.c
 
 dkms install -m "$name" -v "$ver"
