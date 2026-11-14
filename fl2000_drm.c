@@ -294,7 +294,6 @@ static void fl2000_display_enable(struct drm_simple_display_pipe *pipe,
 				  struct drm_crtc_state *cstate,
 				  struct drm_plane_state *plane_state)
 {
-	struct drm_crtc *crtc = &pipe->crtc;
 	struct drm_device *drm = pipe->crtc.dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
 
@@ -303,19 +302,14 @@ static void fl2000_display_enable(struct drm_simple_display_pipe *pipe,
 	UNUSED(plane_state);
 
 	fl2000_stream_enable(drm_if->stream);
-
-	drm_crtc_vblank_on(crtc);
 }
 
 static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
 {
-	struct drm_crtc *crtc = &pipe->crtc;
 	struct drm_device *drm = pipe->crtc.dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
 
 	fl2000_stream_disable(drm_if->stream);
-
-	drm_crtc_vblank_off(crtc);
 }
 
 static void fb2000_dirty(struct drm_framebuffer *fb, const struct iosys_map *map,
@@ -358,14 +352,12 @@ static void fl2000_display_update(struct drm_simple_display_pipe *pipe,
 	    drm_atomic_helper_damage_merged(old_state, state, &rect))
 		fb2000_dirty(state->fb, &shadow->data[0], &rect);
 
+	/* No vblank: the new frame is taken over by the stream worker, so complete right away */
 	if (event) {
 		crtc->state->event = NULL;
 
 		spin_lock_irq(&drm->event_lock);
-		if (crtc->state->active && drm_crtc_vblank_get(crtc) == 0)
-			drm_crtc_arm_vblank_event(crtc, event);
-		else
-			drm_crtc_send_vblank_event(crtc, event);
+		drm_crtc_send_vblank_event(crtc, event);
 		spin_unlock_irq(&drm->event_lock);
 	}
 }
@@ -629,12 +621,10 @@ int fl2000_drm_bind(struct device *master)
 
 	drm_mode_config_reset(drm);
 
-	ret = drm_vblank_init(drm, drm->mode_config.num_crtc);
-	if (ret) {
-		dev_err(drm->dev, "Failed to initialize %d VBLANK(s) (%d)",
-			drm->mode_config.num_crtc, ret);
-		return ret;
-	}
+	/* No vblank support on purpose, like other USB displays: frames are paced by USB transfers,
+	 * and with vblank every atomic commit (e.g. each DIRTYFB from Xorg) would block until the
+	 * next transfer completes, stalling the X server
+	 */
 
 	drm_kms_helper_poll_init(drm);
 

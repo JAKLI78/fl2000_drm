@@ -179,8 +179,6 @@ static void fl2000_stream_data_completion(struct urb *urb)
 		list_move_tail(&cur_sb->list, &stream->render_list);
 		spin_unlock_irqrestore(&stream->list_lock, flags);
 
-		drm_crtc_handle_vblank(stream->crtc);
-
 		/* Kick transmit workqueue */
 		up(&stream->work_sem);
 
