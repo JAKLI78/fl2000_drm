@@ -42,13 +42,16 @@ static const u32 fl2000_pixel_formats[] = {
 /* Maximum acceptable ppm error */
 #define FL2000_PPM_ERR_MAX 500
 
-/* Assume bulk transfers can use only 80% of USB bandwidth */
-#define FL2000_BULK_BW_PERCENT 80
+/* Share of the USB link usable for sustained bulk pixel data. Uncompressed 1080p60 RGB888
+ * (~373 MB/s) underruns on a 5 Gbps link behind a hub, so keep a conservative margin
+ */
+#define FL2000_BULK_BW_PERCENT 60
 
-#define FL2000_BULK_BW_HIGH_SPEED	(480000000ull * 100 / FL2000_BULK_BW_PERCENT / 8)
-#define FL2000_BULK_BW_SUPER_SPEED	(5000000000ull * 100 / FL2000_BULK_BW_PERCENT / 8)
-#define FL2000_BULK_BW_SUPER_SPEED_PLUS (10000000000ull * 100 / FL2000_BULK_BW_PERCENT / 8)
+#define FL2000_BULK_BW_HIGH_SPEED	(480000000ull * FL2000_BULK_BW_PERCENT / 100 / 8)
+#define FL2000_BULK_BW_SUPER_SPEED	(5000000000ull * FL2000_BULK_BW_PERCENT / 100 / 8)
+#define FL2000_BULK_BW_SUPER_SPEED_PLUS (10000000000ull * FL2000_BULK_BW_PERCENT / 100 / 8)
 
+/* pixclock in kHz, as in struct drm_display_mode */
 static unsigned int fl2000_get_bytes_pix(enum usb_device_speed speed, unsigned int pixclock)
 {
 	unsigned int bytes_pix;
@@ -70,7 +73,7 @@ static unsigned int fl2000_get_bytes_pix(enum usb_device_speed speed, unsigned i
 	}
 
 	/* Maximum bytes per pixel with maximum bandwidth */
-	bytes_pix = max_bw / pixclock;
+	bytes_pix = max_bw / (pixclock * 1000u);
 	switch (bytes_pix) {
 	case 0: /* Not enough */
 	case 1: /* RGB 332 not supported*/
