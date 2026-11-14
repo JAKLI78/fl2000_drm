@@ -91,18 +91,36 @@ static unsigned int fl2000_get_bytes_pix(enum usb_device_speed speed, unsigned i
 
 struct fl2000_drm_if {
 	struct usb_device *usb_dev;
+	struct device *dma_dev;
 	struct drm_device drm;
 	struct drm_simple_display_pipe pipe;
 	struct fl2000_stream *stream;
 	struct fl2000_intr *intr;
 };
 
-DEFINE_DRM_GEM_DMA_FOPS(fl2000_drm_driver_fops);
+DEFINE_DRM_GEM_FOPS(fl2000_drm_driver_fops);
 
 static void fl2000_drm_release(struct drm_device *drm)
 {
+	struct fl2000_drm_if *drm_if = drm->dev_private;
+
 	drm_atomic_helper_shutdown(drm);
 	drm_mode_config_cleanup(drm);
+	put_device(drm_if->dma_dev);
+}
+
+/* The DRM device's parent (I2C adapter) cannot do DMA, so attach imported buffers to the USB host
+ * controller instead, like other USB display drivers do
+ */
+static struct drm_gem_object *fl2000_gem_prime_import(struct drm_device *drm,
+						      struct dma_buf *dma_buf)
+{
+	struct fl2000_drm_if *drm_if = drm->dev_private;
+
+	if (!drm_if->dma_dev)
+		return ERR_PTR(-ENODEV);
+
+	return drm_gem_prime_import_dev(drm, dma_buf, drm_if->dma_dev);
 }
 
 static struct drm_driver fl2000_drm_driver = {
@@ -112,7 +130,8 @@ static struct drm_driver fl2000_drm_driver = {
 	.fops = &fl2000_drm_driver_fops,
 	.release = fl2000_drm_release,
 
-	DRM_GEM_DMA_DRIVER_OPS_VMAP,
+	DRM_GEM_SHMEM_DRIVER_OPS,
+	.gem_prime_import = fl2000_gem_prime_import,
 
 	.name = DRM_DRIVER_NAME,
 	.desc = DRM_DRIVER_DESC,
@@ -298,13 +317,13 @@ static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
 	drm_crtc_vblank_off(crtc);
 }
 
-static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
+static void fb2000_dirty(struct drm_framebuffer *fb, const struct iosys_map *map,
+			 struct drm_rect *rect)
 {
 	int ret;
 	int idx;
 	struct drm_device *drm = fb->dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
-	struct drm_gem_dma_object *dma_obj = drm_fb_dma_get_gem_obj(fb, 0);
 
 	UNUSED(rect);
 
@@ -317,7 +336,7 @@ static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 	if (ret)
 		return;
 
-	fl2000_stream_compress(drm_if->stream, dma_obj->vaddr, fb->height, fb->width,
+	fl2000_stream_compress(drm_if->stream, map->vaddr, fb->height, fb->width,
 			       fb->pitches[0]);
 
 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
@@ -332,10 +351,11 @@ static void fl2000_display_update(struct drm_simple_display_pipe *pipe,
 	struct drm_device *drm = crtc->dev;
 	struct drm_pending_vblank_event *event = crtc->state->event;
 	struct drm_plane_state *state = pipe->plane.state;
+	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(state);
 	struct drm_rect rect;
 
-	if (drm_atomic_helper_damage_merged(old_state, state, &rect))
-		fb2000_dirty(state->fb, &rect);
+	if (state->fb && drm_atomic_helper_damage_merged(old_state, state, &rect))
+		fb2000_dirty(state->fb, &shadow->data[0], &rect);
 
 	if (event) {
 		crtc->state->event = NULL;
@@ -354,7 +374,8 @@ static const struct drm_simple_display_pipe_funcs fl2000_display_funcs = {
 	.mode_valid = fl2000_display_mode_valid,
 	.enable = fl2000_display_enable,
 	.disable = fl2000_display_disable,
-	.update = fl2000_display_update
+	.update = fl2000_display_update,
+	DRM_GEM_SIMPLE_DISPLAY_PIPE_SHADOW_PLANE_FUNCS,
 };
 
 static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_display_mode *mode,
@@ -448,7 +469,6 @@ int fl2000_drm_bind(struct device *master)
 	struct fl2000_drm_if *drm_if;
 	struct drm_device *drm;
 	struct drm_mode_config *mode_config;
-	u64 dma_mask;
 
 	dev_info(master, "Binding FL2000 master");
 
@@ -474,13 +494,10 @@ int fl2000_drm_bind(struct device *master)
 	mode_config->min_height = 1;
 	mode_config->max_height = FL20000_MAX_HEIGHT;
 
-	/* Set DMA mask for DRM device from mask of the 'parent' USB device */
-	dma_mask = dma_get_mask(&usb_dev->dev);
-	ret = dma_set_coherent_mask(drm->dev, dma_mask);
-	if (ret) {
-		dev_err(drm->dev, "Cannot set DRM device DMA mask (%d)", ret);
-		return ret;
-	}
+	/* Imported buffers are mapped by the USB host controller */
+	drm_if->dma_dev = usb_intf_get_dma_device(usb_ifnum_to_if(usb_dev, FL2000_USBIF_AVCONTROL));
+	if (!drm_if->dma_dev)
+		dev_warn(drm->dev, "No DMA device, buffer sharing is disabled");
 
 	ret = drm_simple_display_pipe_init(drm, &drm_if->pipe, &fl2000_display_funcs,
 					   fl2000_pixel_formats, ARRAY_SIZE(fl2000_pixel_formats),
