@@ -353,7 +353,11 @@ static void fl2000_display_update(struct drm_simple_display_pipe *pipe,
 	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(state);
 	struct drm_rect rect;
 
-	if (state->fb && drm_atomic_helper_damage_merged(old_state, state, &rect))
+	/* Only feed the stream while it runs: with the CRTC off (e.g. DPMS) nothing consumes frames.
+	 * Turning it on again is a modeset, which updates the whole plane before enable
+	 */
+	if (crtc->state->active && state->fb &&
+	    drm_atomic_helper_damage_merged(old_state, state, &rect))
 		fb2000_dirty(state->fb, &shadow->data[0], &rect);
 
 	if (event) {

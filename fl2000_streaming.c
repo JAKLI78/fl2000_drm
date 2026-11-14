@@ -270,11 +270,19 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	void *dst;
 	u32 dst_line_len;
 
-	BUG_ON(list_empty(&stream->render_list));
-
 	spin_lock_irq(&stream->list_lock);
 
-	cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
+	/* All free buffers taken: replace the newest frame still waiting for transmission, it is
+	 * outdated anyway. If every buffer is in flight, drop this update
+	 */
+	if (!list_empty(&stream->render_list)) {
+		cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
+	} else if (!list_empty(&stream->transmit_list)) {
+		cur_sb = list_last_entry(&stream->transmit_list, struct fl2000_stream_buf, list);
+	} else {
+		spin_unlock_irq(&stream->list_lock);
+		return;
+	}
 	dst = cur_sb->vaddr;
 	dst_line_len = width * stream->bytes_pix;
 
