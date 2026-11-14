@@ -100,7 +100,9 @@ struct fl2000_drm_if {
 	struct fl2000_stream *stream;
 	struct fl2000_intr *intr;
 	struct notifier_block pm_nb;
+	struct mutex pm_lock; /* display suspend state: PM notifier vs. USB reset callbacks */
 	bool suspended; /* display state saved by the PM notifier */
+	bool reset_suspended; /* display state saved for a USB reset */
 };
 
 DEFINE_DRM_GEM_FOPS(fl2000_drm_driver_fops);
@@ -446,7 +448,7 @@ static void fl2000_drm_if_release(struct device *dev, void *res)
 	dev_info(master, "Unbinding FL2000 master");
 
 	unregister_pm_notifier(&drm_if->pm_nb);
-	if (drm_if->suspended) {
+	if (drm_if->suspended || drm_if->reset_suspended) {
 		drm_atomic_state_put(drm->mode_config.suspend_state);
 		drm->mode_config.suspend_state = NULL;
 	}
@@ -490,9 +492,12 @@ static int fl2000_drm_pm_notify(struct notifier_block *nb, unsigned long action,
 
 	UNUSED(data);
 
+	mutex_lock(&drm_if->pm_lock);
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
+		if (drm_if->reset_suspended)
+			break; /* already off, a USB reset is in progress */
 		ret = drm_mode_config_helper_suspend(drm);
 		if (ret)
 			dev_err(drm->dev, "Cannot suspend display (%d)", ret);
@@ -510,6 +515,7 @@ static int fl2000_drm_pm_notify(struct notifier_block *nb, unsigned long action,
 		}
 		break;
 	}
+	mutex_unlock(&drm_if->pm_lock);
 
 	return NOTIFY_DONE;
 }
@@ -538,6 +544,75 @@ int fl2000_drm_resume(struct usb_device *usb_dev)
 	ret = fl2000_intr_resume(drm_if->intr);
 	if (ret)
 		dev_err(&usb_dev->dev, "Cannot restart interrupts (%d)", ret);
+
+	return 0;
+}
+
+/* A USB reset or a power loss during sleep resets the chip: redo the setup done at bind. Mode
+ * dependent registers are programmed again when the display state is restored
+ */
+static void fl2000_hw_reinit(struct usb_device *usb_dev)
+{
+	fl2000_regcache_invalidate(usb_dev);
+	fl2000_reset(usb_dev);
+	fl2000_usb_magic(usb_dev);
+}
+
+/* Resume after the device lost power: same DRM device, the PM notifier restores the display */
+int fl2000_drm_reset_resume(struct usb_device *usb_dev)
+{
+	struct fl2000_drm_if *drm_if = fl2000_drm_if_get(usb_dev);
+
+	fl2000_hw_reinit(usb_dev);
+	if (!drm_if)
+		return 0;
+
+	return fl2000_drm_resume(usb_dev);
+}
+
+/* USB reset while running (e.g. error recovery): turn the display off, keep the DRM device */
+int fl2000_drm_pre_reset(struct usb_device *usb_dev)
+{
+	int ret;
+	struct fl2000_drm_if *drm_if = fl2000_drm_if_get(usb_dev);
+
+	if (!drm_if)
+		return 0;
+
+	mutex_lock(&drm_if->pm_lock);
+	if (!drm_if->suspended) {
+		ret = drm_mode_config_helper_suspend(drm_if->drm);
+		if (ret)
+			dev_err(&usb_dev->dev, "Cannot suspend display for reset (%d)", ret);
+		else
+			drm_if->reset_suspended = true;
+	}
+	mutex_unlock(&drm_if->pm_lock);
+
+	fl2000_intr_suspend(drm_if->intr);
+
+	return 0;
+}
+
+int fl2000_drm_post_reset(struct usb_device *usb_dev)
+{
+	int ret;
+	struct fl2000_drm_if *drm_if = fl2000_drm_if_get(usb_dev);
+
+	fl2000_hw_reinit(usb_dev);
+	if (!drm_if)
+		return 0;
+
+	fl2000_drm_resume(usb_dev);
+
+	mutex_lock(&drm_if->pm_lock);
+	if (drm_if->reset_suspended) {
+		drm_if->reset_suspended = false;
+		ret = drm_mode_config_helper_resume(drm_if->drm);
+		if (ret)
+			dev_err(&usb_dev->dev, "Cannot resume display after reset (%d)", ret);
+	}
+	mutex_unlock(&drm_if->pm_lock);
 
 	return 0;
 }
@@ -645,6 +720,7 @@ int fl2000_drm_bind(struct device *master)
 
 	drm_fbdev_generic_setup(drm, FL2000_FB_BPP);
 
+	mutex_init(&drm_if->pm_lock);
 	drm_if->pm_nb.notifier_call = fl2000_drm_pm_notify;
 	register_pm_notifier(&drm_if->pm_nb);
 

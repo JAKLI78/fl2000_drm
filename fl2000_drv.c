@@ -208,12 +208,42 @@ static int fl2000_resume(struct usb_interface *interface)
 	return fl2000_drm_resume(interface_to_usbdev(interface));
 }
 
+/* Without these the USB core would unbind and rebind the driver on a reset, creating a new display
+ * device. All interfaces must have them, otherwise the core still rebinds the ones lacking them
+ */
+static int fl2000_reset_resume(struct usb_interface *interface)
+{
+	if (interface->cur_altsetting->desc.bInterfaceNumber != FL2000_USBIF_AVCONTROL)
+		return 0;
+
+	return fl2000_drm_reset_resume(interface_to_usbdev(interface));
+}
+
+static int fl2000_pre_reset(struct usb_interface *interface)
+{
+	if (interface->cur_altsetting->desc.bInterfaceNumber != FL2000_USBIF_AVCONTROL)
+		return 0;
+
+	return fl2000_drm_pre_reset(interface_to_usbdev(interface));
+}
+
+static int fl2000_post_reset(struct usb_interface *interface)
+{
+	if (interface->cur_altsetting->desc.bInterfaceNumber != FL2000_USBIF_AVCONTROL)
+		return 0;
+
+	return fl2000_drm_post_reset(interface_to_usbdev(interface));
+}
+
 static struct usb_driver fl2000_driver = {
 	.name = USB_DRIVER_NAME,
 	.probe = fl2000_probe,
 	.disconnect = fl2000_disconnect,
 	.suspend = fl2000_suspend,
 	.resume = fl2000_resume,
+	.reset_resume = fl2000_reset_resume,
+	.pre_reset = fl2000_pre_reset,
+	.post_reset = fl2000_post_reset,
 	.id_table = fl2000_id_table,
 	.supports_autosuspend = false,
 	.disable_hub_initiated_lpm = true,

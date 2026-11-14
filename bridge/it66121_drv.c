@@ -270,11 +270,11 @@ static void it66121_intr_work(struct work_struct *work_item)
 	struct device *dev = priv->bridge.dev->dev;
 	bool event = false;
 
+	/* Reads fail while the USB device resets: keep polling, the next round succeeds */
 	ret = regmap_field_read(priv->irq_pending, &val);
 	if (ret) {
-		/* TODO: Process error? */
-		dev_err(dev, "Cannot read interrupt status (%d)", ret);
-		return;
+		dev_dbg(dev, "Cannot read interrupt status (%d)", ret);
+		goto next;
 	}
 
 	/* XXX: There are at least 5 registers that can source interrupt:
@@ -291,9 +291,8 @@ static void it66121_intr_work(struct work_struct *work_item)
 
 		ret = regmap_read(priv->regmap, IT66121_INT_STATUS_1, &status_1.val);
 		if (ret) {
-			/* TODO: Process error? */
-			dev_err(dev, "Cannot read IT66121_INT_STATUS_1 (%d)", ret);
-			return;
+			dev_dbg(dev, "Cannot read IT66121_INT_STATUS_1 (%d)", ret);
+			goto next;
 		}
 
 		regmap_field_write(priv->clr_irq, 1);
@@ -319,6 +318,7 @@ static void it66121_intr_work(struct work_struct *work_item)
 	if (event)
 		drm_helper_hpd_irq_event(priv->bridge.dev);
 
+next:
 	queue_delayed_work(priv->work_queue, &priv->work, msecs_to_jiffies(IRQ_POLL_INTRVL));
 }
 
@@ -509,22 +509,9 @@ static const struct component_ops it66121_component_ops = {
 	.unbind = it66121_unbind,
 };
 
-/* TODO: rewrite register access properly, add error processing */
-static int it66121_bridge_attach(struct drm_bridge *bridge, enum drm_bridge_attach_flags flags)
+/* Chip setup at attach, and again on resume: the chip may have lost power with the adapter */
+static void it66121_hw_init(struct it66121_priv *priv)
 {
-	int ret;
-	struct it66121_priv *priv = container_of(bridge, struct it66121_priv, bridge);
-
-	if (flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR) {
-		DRM_ERROR("Need connector for mode configuration");
-		return -ENODEV;
-	}
-
-	if (!bridge->encoder) {
-		DRM_ERROR("Parent encoder object not found");
-		return -ENODEV;
-	}
-
 	/* Reset according to IT66121 manual */
 	regmap_write_bits(priv->regmap, IT66121_SW_RST, IT66121_SW_REF_RST_HDMITX,
 			  IT66121_SW_REF_RST_HDMITX);
@@ -565,6 +552,28 @@ static int it66121_bridge_attach(struct drm_bridge *bridge, enum drm_bridge_atta
 	regmap_write(priv->regmap, IT66121_DDC_CONTROL,
 		     IT66121_DDC_MASTER_DDC | IT66121_DDC_MASTER_HOST);
 
+	/* Start interrupts */
+	regmap_write_bits(priv->regmap, IT66121_INT_MASK_1, IT66121_MASK_DDC, 0);
+}
+
+/* TODO: rewrite register access properly, add error processing */
+static int it66121_bridge_attach(struct drm_bridge *bridge, enum drm_bridge_attach_flags flags)
+{
+	int ret;
+	struct it66121_priv *priv = container_of(bridge, struct it66121_priv, bridge);
+
+	if (flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR) {
+		DRM_ERROR("Need connector for mode configuration");
+		return -ENODEV;
+	}
+
+	if (!bridge->encoder) {
+		DRM_ERROR("Parent encoder object not found");
+		return -ENODEV;
+	}
+
+	it66121_hw_init(priv);
+
 	ret = drm_connector_init(bridge->dev, &priv->connector, &it66121_connector_funcs,
 				 DRM_MODE_CONNECTOR_HDMIA);
 	if (ret) {
@@ -582,8 +591,6 @@ static int it66121_bridge_attach(struct drm_bridge *bridge, enum drm_bridge_atta
 
 	drm_connector_register(&priv->connector);
 
-	/* Start interrupts */
-	regmap_write_bits(priv->regmap, IT66121_INT_MASK_1, IT66121_MASK_DDC, 0);
 	priv->polling = true;
 	queue_delayed_work(priv->work_queue, &priv->work, msecs_to_jiffies(IRQ_POLL_INTRVL));
 
@@ -918,8 +925,14 @@ static int it66121_resume(struct device *dev)
 	struct drm_bridge *bridge = dev_get_drvdata(dev);
 	struct it66121_priv *priv = container_of(bridge, struct it66121_priv, bridge);
 
-	if (priv->polling)
+	if (priv->polling) {
+		/* Registers are at reset values after power loss: drop the cache and set up again.
+		 * Harmless otherwise, the display is still off here and its mode is set on restore
+		 */
+		regcache_drop_region(priv->regmap, 0, regmap_get_max_register(priv->regmap));
+		it66121_hw_init(priv);
 		queue_delayed_work(priv->work_queue, &priv->work, msecs_to_jiffies(IRQ_POLL_INTRVL));
+	}
 
 	return 0;
 }

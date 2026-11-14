@@ -179,6 +179,7 @@ struct regmap *fl2000_regmap_init(struct usb_device *usb_dev);
 /* Registers interface */
 int fl2000_reset(struct usb_device *usb_dev);
 int fl2000_usb_magic(struct usb_device *usb_dev);
+void fl2000_regcache_invalidate(struct usb_device *usb_dev);
 int fl2000_afe_magic(struct usb_device *usb_dev);
 int fl2000_set_transfers(struct usb_device *usb_dev);
 int fl2000_set_pixfmt(struct usb_device *usb_dev, u32 bytes_pix);
@@ -193,5 +194,8 @@ int fl2000_drm_bind(struct device *master);
 void fl2000_drm_unbind(struct device *master);
 int fl2000_drm_suspend(struct usb_device *usb_dev);
 int fl2000_drm_resume(struct usb_device *usb_dev);
+int fl2000_drm_reset_resume(struct usb_device *usb_dev);
+int fl2000_drm_pre_reset(struct usb_device *usb_dev);
+int fl2000_drm_post_reset(struct usb_device *usb_dev);
 
 #endif /* __FL2000_DRM_H__ */

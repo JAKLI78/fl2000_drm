@@ -221,6 +221,17 @@ int fl2000_reset(struct usb_device *usb_dev)
 	return 0;
 }
 
+/* After a USB reset or power loss the registers are back at reset values: forget cached ones, so
+ * that read-modify-write cycles start from the real hardware state again
+ */
+void fl2000_regcache_invalidate(struct usb_device *usb_dev)
+{
+	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
+
+	if (regmap)
+		regcache_drop_region(regmap, 0, regmap_get_max_register(regmap));
+}
+
 int fl2000_afe_magic(struct usb_device *usb_dev)
 {
 	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);

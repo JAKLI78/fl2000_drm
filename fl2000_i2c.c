@@ -159,8 +159,18 @@ struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev)
 
 	/* The client is removed together with the adapter; its driver module is loaded by alias */
 	bridge = i2c_new_scanned_device(adapter, &bridge_info, bridge_addrs, fl2000_i2c_probe_bridge);
-	if (IS_ERR(bridge))
+	if (IS_ERR(bridge)) {
 		dev_warn(&usb_dev->dev, "No HDMI bridge found on FL2000 I2C bus (%ld)", PTR_ERR(bridge));
+	} else {
+		/* The bridge is set up again on resume over this bus, so it must resume after the AV
+		 * control interface reinitialized the chip. Removed with either device
+		 */
+		struct usb_interface *avcontrol = usb_ifnum_to_if(usb_dev, FL2000_USBIF_AVCONTROL);
+
+		if (!avcontrol ||
+		    !device_link_add(&bridge->dev, &avcontrol->dev, DL_FLAG_STATELESS))
+			dev_warn(&usb_dev->dev, "Cannot order HDMI bridge resume");
+	}
 
 	usb_make_path(usb_dev, usb_path, sizeof(usb_path));
 	dev_dbg(&usb_dev->dev, "Created FL2000 bridge I2C bus %d at interface %s",
