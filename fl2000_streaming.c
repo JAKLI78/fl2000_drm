@@ -154,11 +154,12 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	struct fl2000_stream_buf *cur_sb = urb->transfer_buffer;
 	struct usb_device *usb_dev = urb->dev;
 	struct fl2000_stream *stream = urb->context;
+	unsigned long flags;
 
 	if (stream) {
-		spin_lock_irq(&stream->list_lock);
+		spin_lock_irqsave(&stream->list_lock, flags);
 		list_move_tail(&cur_sb->list, &stream->render_list);
-		spin_unlock(&stream->list_lock);
+		spin_unlock_irqrestore(&stream->list_lock, flags);
 
 		drm_crtc_handle_vblank(stream->crtc);
 
@@ -209,7 +210,7 @@ static void fl2000_stream_work(struct work_struct *work)
 						  list);
 		}
 		list_move_tail(&cur_sb->list, &stream->wait_list);
-		spin_unlock(&stream->list_lock);
+		spin_unlock_irq(&stream->list_lock);
 
 		data_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!data_urb) {
@@ -232,6 +233,10 @@ static void fl2000_stream_work(struct work_struct *work)
 		ret = fl2000_submit_urb(data_urb);
 		if (ret) {
 			dev_err(&usb_dev->dev, "Data URB error %d", ret);
+			/* Never submitted, so never completes: unanchor or usb_kill_anchored_urbs()
+			 * in fl2000_stream_disable() loops on it forever
+			 */
+			usb_unanchor_urb(data_urb);
 			usb_free_urb(data_urb);
 			stream->enabled = false;
 		}
@@ -289,7 +294,7 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	}
 
 	list_move_tail(&cur_sb->list, &stream->transmit_list);
-	spin_unlock(&stream->list_lock);
+	spin_unlock_irq(&stream->list_lock);
 }
 
 int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_pix)
@@ -358,7 +363,7 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 		cur_sb = list_first_entry(&stream->wait_list, struct fl2000_stream_buf, list);
 		list_move_tail(&cur_sb->list, &stream->render_list);
 	}
-	spin_unlock(&stream->list_lock);
+	spin_unlock_irq(&stream->list_lock);
 }
 
 /**
