@@ -12,7 +12,7 @@ struct fl2000_intr {
 	struct usb_device *usb_dev;
 	struct drm_device *drm;
 	u8 *buf;
-	int pipe;
+	struct urb *urb;
 	struct work_struct work;
 	struct workqueue_struct *work_queue;
 };
@@ -20,22 +20,36 @@ struct fl2000_intr {
 static void fl2000_intr_work(struct work_struct *work)
 {
 	struct fl2000_intr *intr = container_of(work, struct fl2000_intr, work);
-	struct usb_device *usb_dev = intr->usb_dev;
+	int ret;
 
-	while (1) {
-		int ret;
+	if (fl2000_check_interrupt(intr->usb_dev))
+		drm_kms_helper_hotplug_event(intr->drm);
 
-		/* Receive interrupt message */
-		ret = usb_interrupt_msg(usb_dev, intr->pipe, intr->buf, INTR_BUFSIZE, NULL, 0);
-		if (ret) {
-			dev_err(&usb_dev->dev, "Interrupt message failed (%d)", ret);
-			/* TODO: Signal fault to system and start shutdown of usb_dev */
-			return;
-		}
+	/* Wait for the next interrupt; fails with -EPERM once release poisoned the URB */
+	ret = usb_submit_urb(intr->urb, GFP_KERNEL);
+	if (ret && ret != -EPERM)
+		dev_err(&intr->usb_dev->dev, "Interrupt URB resubmit failed (%d)", ret);
+}
 
-		ret = fl2000_check_interrupt(intr->usb_dev);
-		if (ret)
-			drm_kms_helper_hotplug_event(intr->drm);
+static void fl2000_intr_complete(struct urb *urb)
+{
+	struct fl2000_intr *intr = urb->context;
+
+	switch (urb->status) {
+	case 0:
+		/* Interrupt processing reads registers over USB, so do it in a work queue */
+		queue_work(intr->work_queue, &intr->work);
+		break;
+	case -ENOENT:
+	case -ECONNRESET:
+	case -ESHUTDOWN:
+	case -ENODEV:
+		/* URB killed or device gone */
+		break;
+	default:
+		dev_err(&intr->usb_dev->dev, "Interrupt message failed (%d)", urb->status);
+		/* TODO: Signal fault to system and start shutdown of usb_dev */
+		break;
 	}
 }
 
@@ -45,9 +59,15 @@ static void fl2000_intr_release(struct device *dev, void *res)
 
 	UNUSED(dev);
 
-	cancel_work_sync(&intr->work);
-	destroy_workqueue(intr->work_queue);
+	/* Poison first so the work cannot resubmit the URB while being cancelled */
+	if (intr->urb)
+		usb_poison_urb(intr->urb);
+	if (intr->work_queue) {
+		cancel_work_sync(&intr->work);
+		destroy_workqueue(intr->work_queue);
+	}
 
+	usb_free_urb(intr->urb);
 	kfree(intr->buf);
 }
 
@@ -87,16 +107,17 @@ struct fl2000_intr *fl2000_intr_create(struct usb_device *usb_dev, struct drm_de
 	devres_add(&usb_dev->dev, intr);
 
 	intr->usb_dev = usb_dev;
-	intr->pipe = usb_rcvintpipe(usb_dev, ep);
 	intr->drm = drm;
 	intr->buf = kmalloc(INTR_BUFSIZE, GFP_KERNEL);
-	if (!intr->buf) {
+	intr->urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!intr->buf || !intr->urb) {
 		dev_err(&usb_dev->dev, "Cannot allocate interrupt data");
 		devres_release(&usb_dev->dev, fl2000_intr_release, NULL, NULL);
 		return ERR_PTR(-ENOMEM);
 	}
+	usb_fill_int_urb(intr->urb, usb_dev, usb_rcvintpipe(usb_dev, ep), intr->buf,
+			 INTR_BUFSIZE, fl2000_intr_complete, intr, desc->bInterval);
 
-	/* This possibly involves reading I2C registers, etc. so better to schedule a work queue */
 	INIT_WORK(&intr->work, &fl2000_intr_work);
 	intr->work_queue = create_workqueue("fl2000_interrupt");
 	if (!intr->work_queue) {
@@ -104,7 +125,13 @@ struct fl2000_intr *fl2000_intr_create(struct usb_device *usb_dev, struct drm_de
 		devres_release(&usb_dev->dev, fl2000_intr_release, NULL, NULL);
 		return ERR_PTR(-ENOMEM);
 	}
-	queue_work(intr->work_queue, &intr->work);
+
+	ret = usb_submit_urb(intr->urb, GFP_KERNEL);
+	if (ret) {
+		dev_err(&usb_dev->dev, "Interrupt URB submit failed (%d)", ret);
+		devres_release(&usb_dev->dev, fl2000_intr_release, NULL, NULL);
+		return ERR_PTR(ret);
+	}
 
 	return intr;
 }
