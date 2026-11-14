@@ -42,35 +42,37 @@ static const u32 fl2000_pixel_formats[] = {
 /* Maximum acceptable ppm error */
 #define FL2000_PPM_ERR_MAX 500
 
-/* Share of the USB link usable for sustained bulk pixel data. Uncompressed 1080p60 RGB888
- * (~373 MB/s) underruns on a 5 Gbps link behind a hub, so keep a conservative margin
+/* Share of the USB link planned for sustained bulk pixel data. The default keeps 1080p60 at
+ * RGB565: RGB888 (~373 MB/s) underran on a 5 Gbps link behind a hub in early tests. Higher values
+ * select RGB888 for more modes; the monitor losing signal means the link cannot sustain it
  */
-#define FL2000_BULK_BW_PERCENT 60
-
-#define FL2000_BULK_BW_HIGH_SPEED	(480000000ull * FL2000_BULK_BW_PERCENT / 100 / 8)
-#define FL2000_BULK_BW_SUPER_SPEED	(5000000000ull * FL2000_BULK_BW_PERCENT / 100 / 8)
-#define FL2000_BULK_BW_SUPER_SPEED_PLUS (10000000000ull * FL2000_BULK_BW_PERCENT / 100 / 8)
+static unsigned int bandwidth_percent = 60;
+module_param(bandwidth_percent, uint, 0644);
+MODULE_PARM_DESC(bandwidth_percent,
+		 "Share of the USB link used for pixels, 10-95 (default 60), applied on next mode set");
 
 /* pixclock in kHz, as in struct drm_display_mode */
 static unsigned int fl2000_get_bytes_pix(enum usb_device_speed speed, unsigned int pixclock)
 {
 	unsigned int bytes_pix;
 	unsigned int max_bw;
+	u64 link_bps;
 
 	/* Calculate maximum bandwidth, bytes per second */
 	switch (speed) {
 	case USB_SPEED_HIGH:
-		max_bw = FL2000_BULK_BW_HIGH_SPEED;
+		link_bps = 480000000ull;
 		break;
 	case USB_SPEED_SUPER:
-		max_bw = FL2000_BULK_BW_SUPER_SPEED;
+		link_bps = 5000000000ull;
 		break;
 	case USB_SPEED_SUPER_PLUS:
-		max_bw = FL2000_BULK_BW_SUPER_SPEED_PLUS;
+		link_bps = 10000000000ull;
 		break;
 	default:
 		return 0;
 	}
+	max_bw = (unsigned int)(link_bps * clamp(READ_ONCE(bandwidth_percent), 10u, 95u) / 100 / 8);
 
 	/* Maximum bytes per pixel with maximum bandwidth */
 	bytes_pix = max_bw / (pixclock * 1000u);
@@ -392,7 +394,8 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 		return;
 
 	dev_info(drm->dev, "Mode requested:  " DRM_MODE_FMT, DRM_MODE_ARG(mode));
-	dev_info(drm->dev, "Mode configured: " DRM_MODE_FMT, DRM_MODE_ARG(adjusted_mode));
+	dev_info(drm->dev, "Mode configured: " DRM_MODE_FMT ", %u-bit color", DRM_MODE_ARG(adjusted_mode),
+		 bytes_pix * 8);
 
 	/* Prepare timing configuration */
 	timings.hactive = adjusted_mode->hdisplay;

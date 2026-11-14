@@ -56,6 +56,7 @@ struct fl2000_stream {
 	 */
 	u32 *conv;
 	size_t conv_size;
+	bool dithered; /* dither setting of last_sb's content */
 	struct work_struct work;
 	struct workqueue_struct *work_queue;
 	struct semaphore work_sem;
@@ -199,11 +200,38 @@ static void fl2000_xrgb888_to_rgb888_line(u8 *dbuf, u32 *sbuf, u32 pixels)
 	}
 }
 
-static void fl2000_xrgb888_to_rgb565_line(u16 *dbuf, u32 *sbuf, u32 pixels)
+static bool dither = true;
+module_param(dither, bool, 0644);
+MODULE_PARM_DESC(dither, "Ordered dithering for 16-bit color (default on)");
+
+/* 4x4 Bayer matrix as per-channel offsets added before dropping low bits: 0..7 for the 5-bit red
+ * and blue (3 bits dropped), 0..3 for the 6-bit green (2 bits dropped). Each offset occurs equally
+ * often, so the average color is preserved
+ */
+#define FL2000_BAYER(m) ((((m) / 2) << 16) | (((m) / 4) << 8) | ((m) / 2))
+static const u32 fl2000_dither[4][4] __aligned(16) = {
+	{ FL2000_BAYER(0), FL2000_BAYER(8), FL2000_BAYER(2), FL2000_BAYER(10) },
+	{ FL2000_BAYER(12), FL2000_BAYER(4), FL2000_BAYER(14), FL2000_BAYER(6) },
+	{ FL2000_BAYER(3), FL2000_BAYER(11), FL2000_BAYER(1), FL2000_BAYER(9) },
+	{ FL2000_BAYER(15), FL2000_BAYER(7), FL2000_BAYER(13), FL2000_BAYER(5) },
+};
+
+static u32 fl2000_dither_add(u32 p, u32 d)
+{
+	u32 q = 0;
+
+	for (int c = 0; c < 24; c += 8)
+		q |= min_t(u32, ((p >> c) & 0xFF) + ((d >> c) & 0xFF), 0xFF) << c;
+
+	return q;
+}
+
+static void fl2000_xrgb888_to_rgb565_line(u16 *dbuf, u32 *sbuf, u32 pixels, const u32 *dither)
 {
 	for (unsigned int x = 0; x < pixels; x++) {
-		u16 val565 = ((sbuf[x] & 0x00F80000) >> 8) | ((sbuf[x] & 0x0000FC00) >> 5) |
-			     ((sbuf[x] & 0x000000F8) >> 3);
+		u32 p = dither ? fl2000_dither_add(sbuf[x], dither[x & 3]) : sbuf[x];
+		u16 val565 = ((p & 0x00F80000) >> 8) | ((p & 0x0000FC00) >> 5) |
+			     ((p & 0x000000F8) >> 3);
 		dbuf[x ^ 2] = val565;
 	}
 }
@@ -214,11 +242,18 @@ static void fl2000_xrgb888_to_rgb565_line(u16 *dbuf, u32 *sbuf, u32 pixels)
 static void fl2000_stream_fill(struct fl2000_stream *stream, struct fl2000_stream_buf *cur_sb)
 {
 	struct fl2000_stream_buf *last_sb = stream->last_sb;
+	const bool dithered = READ_ONCE(dither);
 	unsigned int y1, y2, width;
 	size_t line_len, size;
 	u32 dst_line_len;
 	u32 *src;
 	u8 *dst;
+
+	/* Dither setting changed: redraw everything in the new style */
+	if (dithered != stream->dithered) {
+		stream->dithered = dithered;
+		last_sb = NULL;
+	}
 
 	if (last_sb && last_sb != cur_sb)
 		memcpy(cur_sb->vaddr, last_sb->vaddr, stream->buf_size);
@@ -255,13 +290,16 @@ static void fl2000_stream_fill(struct fl2000_stream *stream, struct fl2000_strea
 
 	mutex_unlock(&stream->staging_lock);
 
+	/* Dither pattern row for a line, by absolute position so partial updates match */
+#define drow(y) (dithered ? fl2000_dither[(y) & 3] : NULL)
+
 	/* Whole lines only: pixels are packed in swapped 8-byte groups */
 	src = stream->conv + (size_t)y1 * width;
 	dst = (u8 *)cur_sb->vaddr + (size_t)y1 * dst_line_len;
 	for (unsigned int y = y1; y < y2; y++) {
 		switch (stream->bytes_pix) {
 		case 2:
-			fl2000_xrgb888_to_rgb565_line((u16 *)dst, src, width);
+			fl2000_xrgb888_to_rgb565_line((u16 *)dst, src, width, drow(y));
 			break;
 		case 3:
 			fl2000_xrgb888_to_rgb888_line(dst, src, width);
@@ -273,6 +311,7 @@ static void fl2000_stream_fill(struct fl2000_stream *stream, struct fl2000_strea
 		dst += dst_line_len;
 	}
 
+#undef drow
 	stream->last_sb = cur_sb;
 	return;
 
