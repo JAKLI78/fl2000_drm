@@ -24,6 +24,17 @@ static const u32 fl2000_pixel_formats[] = {
 	DRM_FORMAT_XRGB8888,
 };
 
+/* The FL2000 has no cursor hardware: the cursor is blended into the frame by the stream worker.
+ * Offering it still matters, because Xorg falls back to a software cursor on all screens, with
+ * flicker, as soon as one of them has no cursor plane
+ */
+static const u32 fl2000_cursor_formats[] = {
+	DRM_FORMAT_ARGB8888,
+};
+
+#define FL2000_CURSOR_SIZE     64 /* preferred, as reported to userspace */
+#define FL2000_CURSOR_SIZE_MAX 256
+
 /* Maximum pixel clock set to 500MHz. It is hard to get more or less precise PLL configuration for
  * higher clock
  */
@@ -96,7 +107,10 @@ struct fl2000_drm_if {
 	struct device *master; /* component master (I2C adapter), not the DRM parent */
 	struct device *dma_dev;
 	struct drm_device *drm;
-	struct drm_simple_display_pipe pipe;
+	struct drm_plane primary;
+	struct drm_plane cursor;
+	struct drm_crtc crtc;
+	struct drm_encoder encoder;
 	struct fl2000_stream *stream;
 	struct fl2000_intr *intr;
 	struct notifier_block pm_nb;
@@ -276,104 +290,175 @@ static int fl2000_mode_calc(const struct drm_display_mode *mode,
 	return -1;
 }
 
-static enum drm_mode_status fl2000_display_mode_valid(struct drm_simple_display_pipe *pipe,
-						      const struct drm_display_mode *mode)
+static enum drm_mode_status fl2000_crtc_mode_valid(struct drm_crtc *crtc,
+						   const struct drm_display_mode *mode)
 {
-	struct drm_device *drm = pipe->crtc.dev;
+	struct fl2000_drm_if *drm_if = crtc->dev->dev_private;
 	struct drm_display_mode adjusted_mode;
 	struct fl2000_pll pll;
-	struct fl2000_drm_if *drm_if = drm->dev_private;
-	struct usb_device *usb_dev = drm_if->usb_dev;
 
 	/* Get PLL configuration and check if mode adjustments needed */
 	if (fl2000_mode_calc(mode, &adjusted_mode, &pll))
 		return MODE_BAD;
 
-	if (fl2000_get_bytes_pix(usb_dev->speed, adjusted_mode.clock) == 0)
+	if (fl2000_get_bytes_pix(drm_if->usb_dev->speed, adjusted_mode.clock) == 0)
 		return MODE_BAD;
 
 	return MODE_OK;
 }
 
-static void fl2000_display_enable(struct drm_simple_display_pipe *pipe,
-				  struct drm_crtc_state *cstate,
-				  struct drm_plane_state *plane_state)
+static void fl2000_crtc_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
-	struct drm_device *drm = pipe->crtc.dev;
-	struct fl2000_drm_if *drm_if = drm->dev_private;
-
-	/* TODO: check cstate/pstate? */
-	UNUSED(cstate);
-	UNUSED(plane_state);
+	struct fl2000_drm_if *drm_if = crtc->dev->dev_private;
 
 	fl2000_stream_enable(drm_if->stream);
 }
 
-static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
+static void fl2000_crtc_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
-	struct drm_device *drm = pipe->crtc.dev;
-	struct fl2000_drm_if *drm_if = drm->dev_private;
+	struct fl2000_drm_if *drm_if = crtc->dev->dev_private;
 
 	fl2000_stream_disable(drm_if->stream);
 }
 
-static void fb2000_dirty(struct drm_framebuffer *fb, const struct iosys_map *map,
-			 struct drm_rect *rect)
+/* No vblank: plane contents are taken over by the stream worker, so complete right away */
+static void fl2000_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
-	int ret;
-	int idx;
-	struct drm_device *drm = fb->dev;
-	struct fl2000_drm_if *drm_if = drm->dev_private;
+	struct drm_pending_vblank_event *event = crtc->state->event;
 
-	if (!drm_dev_enter(fb->dev, &idx)) {
-		dev_err(drm->dev, "DRM enter failed!");
-		return;
+	if (event) {
+		crtc->state->event = NULL;
+
+		spin_lock_irq(&crtc->dev->event_lock);
+		drm_crtc_send_vblank_event(crtc, event);
+		spin_unlock_irq(&crtc->dev->event_lock);
 	}
+}
 
-	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
-	if (!ret) {
-		fl2000_stream_update(drm_if->stream, map->vaddr, fb->width, fb->height,
-				     fb->pitches[0], rect);
+/* Logical pipe management (no HW configuration here) */
+static const struct drm_crtc_helper_funcs fl2000_crtc_helper_funcs = {
+	.mode_valid = fl2000_crtc_mode_valid,
+	.atomic_check = drm_crtc_helper_atomic_check,
+	.atomic_flush = fl2000_crtc_atomic_flush,
+	.atomic_enable = fl2000_crtc_atomic_enable,
+	.atomic_disable = fl2000_crtc_atomic_disable,
+};
+
+static const struct drm_crtc_funcs fl2000_crtc_funcs = {
+	.reset = drm_atomic_helper_crtc_reset,
+	.destroy = drm_crtc_cleanup,
+	.set_config = drm_atomic_helper_set_config,
+	.page_flip = drm_atomic_helper_page_flip,
+	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+};
+
+/* Primary plane covers the whole CRTC, the cursor plane may be anywhere, even partly off screen */
+static int fl2000_plane_check(struct drm_plane *plane, struct drm_atomic_state *state,
+			      bool is_cursor)
+{
+	struct drm_plane_state *plane_state = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *crtc_state = NULL;
+
+	if (plane_state->crtc)
+		crtc_state = drm_atomic_get_new_crtc_state(state, plane_state->crtc);
+
+	if (is_cursor && plane_state->fb &&
+	    (plane_state->fb->width > FL2000_CURSOR_SIZE_MAX ||
+	     plane_state->fb->height > FL2000_CURSOR_SIZE_MAX))
+		return -EINVAL;
+
+	return drm_atomic_helper_check_plane_state(plane_state, crtc_state, DRM_PLANE_NO_SCALING,
+						   DRM_PLANE_NO_SCALING, is_cursor, is_cursor);
+}
+
+static int fl2000_primary_atomic_check(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	return fl2000_plane_check(plane, state, false);
+}
+
+static int fl2000_cursor_atomic_check(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	return fl2000_plane_check(plane, state, true);
+}
+
+static void fl2000_primary_atomic_update(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state, plane);
+	struct drm_plane_state *plane_state = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(plane_state);
+	struct fl2000_drm_if *drm_if = plane->dev->dev_private;
+	struct drm_framebuffer *fb = plane_state->fb;
+	struct drm_rect rect;
+	int idx;
+
+	/* Only feed the stream while it runs: with the CRTC off (e.g. DPMS) nothing consumes frames.
+	 * Turning it on again is a modeset, which updates the whole plane before enable
+	 */
+	if (!fb || !plane_state->crtc || !plane_state->crtc->state->active ||
+	    !drm_atomic_helper_damage_merged(old_state, plane_state, &rect))
+		return;
+
+	if (!drm_dev_enter(plane->dev, &idx))
+		return;
+
+	if (!drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE)) {
+		fl2000_stream_update(drm_if->stream, shadow->data[0].vaddr, fb->width, fb->height,
+				     fb->pitches[0], &rect);
 		drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
 	}
 
 	drm_dev_exit(idx);
 }
 
-static void fl2000_display_update(struct drm_simple_display_pipe *pipe,
-				  struct drm_plane_state *old_state)
+static void fl2000_cursor_atomic_update(struct drm_plane *plane, struct drm_atomic_state *state)
 {
-	struct drm_crtc *crtc = &pipe->crtc;
-	struct drm_device *drm = crtc->dev;
-	struct drm_pending_vblank_event *event = crtc->state->event;
-	struct drm_plane_state *state = pipe->plane.state;
-	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(state);
-	struct drm_rect rect;
+	struct drm_plane_state *plane_state = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(plane_state);
+	struct fl2000_drm_if *drm_if = plane->dev->dev_private;
+	struct drm_framebuffer *fb = plane_state->fb;
+	int idx;
 
-	/* Only feed the stream while it runs: with the CRTC off (e.g. DPMS) nothing consumes frames.
-	 * Turning it on again is a modeset, which updates the whole plane before enable
-	 */
-	if (crtc->state->active && state->fb &&
-	    drm_atomic_helper_damage_merged(old_state, state, &rect))
-		fb2000_dirty(state->fb, &shadow->data[0], &rect);
-
-	/* No vblank: the new frame is taken over by the stream worker, so complete right away */
-	if (event) {
-		crtc->state->event = NULL;
-
-		spin_lock_irq(&drm->event_lock);
-		drm_crtc_send_vblank_event(crtc, event);
-		spin_unlock_irq(&drm->event_lock);
+	if (!plane_state->visible || !fb) {
+		fl2000_stream_cursor(drm_if->stream, NULL, 0, 0, 0, 0, 0);
+		return;
 	}
+
+	if (!drm_dev_enter(plane->dev, &idx))
+		return;
+
+	if (!drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE)) {
+		/* Unclipped source and position: the stream clips to the screen */
+		const u8 *src = (const u8 *)shadow->data[0].vaddr +
+				(plane_state->src_y >> 16) * fb->pitches[0] +
+				(plane_state->src_x >> 16) * sizeof(u32);
+
+		fl2000_stream_cursor(drm_if->stream, src, plane_state->src_w >> 16,
+				     plane_state->src_h >> 16, fb->pitches[0], plane_state->crtc_x,
+				     plane_state->crtc_y);
+		drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+	}
+
+	drm_dev_exit(idx);
 }
 
-/* Logical pipe management (no HW configuration here) */
-static const struct drm_simple_display_pipe_funcs fl2000_display_funcs = {
-	.mode_valid = fl2000_display_mode_valid,
-	.enable = fl2000_display_enable,
-	.disable = fl2000_display_disable,
-	.update = fl2000_display_update,
-	DRM_GEM_SIMPLE_DISPLAY_PIPE_SHADOW_PLANE_FUNCS,
+static const struct drm_plane_helper_funcs fl2000_primary_helper_funcs = {
+	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
+	.atomic_check = fl2000_primary_atomic_check,
+	.atomic_update = fl2000_primary_atomic_update,
+};
+
+static const struct drm_plane_helper_funcs fl2000_cursor_helper_funcs = {
+	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
+	.atomic_check = fl2000_cursor_atomic_check,
+	.atomic_update = fl2000_cursor_atomic_update,
+};
+
+static const struct drm_plane_funcs fl2000_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = drm_plane_cleanup,
+	DRM_GEM_SHADOW_PLANE_FUNCS,
 };
 
 static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_display_mode *mode,
@@ -461,7 +546,7 @@ static void fl2000_drm_if_release(struct device *dev, void *res)
 	drm_atomic_helper_shutdown(drm);
 
 	/* Detach bridge */
-	component_unbind_all(master, &drm_if->pipe);
+	component_unbind_all(master, &drm_if->encoder);
 
 	/* Start streaming interface */
 	fl2000_stream_destroy(usb_dev);
@@ -668,31 +753,59 @@ int fl2000_drm_bind(struct device *master)
 	mode_config->max_width = FL20000_MAX_WIDTH;
 	mode_config->min_height = 1;
 	mode_config->max_height = FL20000_MAX_HEIGHT;
+	mode_config->cursor_width = FL2000_CURSOR_SIZE;
+	mode_config->cursor_height = FL2000_CURSOR_SIZE;
 
 	/* Imported buffers are mapped by the USB host controller */
 	drm_if->dma_dev = usb_intf_get_dma_device(usb_ifnum_to_if(usb_dev, FL2000_USBIF_AVCONTROL));
 	if (!drm_if->dma_dev)
 		dev_warn(drm->dev, "No DMA device, buffer sharing is disabled");
 
-	ret = drm_simple_display_pipe_init(drm, &drm_if->pipe, &fl2000_display_funcs,
-					   fl2000_pixel_formats, ARRAY_SIZE(fl2000_pixel_formats),
-					   NULL, NULL);
+	ret = drm_universal_plane_init(drm, &drm_if->primary, 0, &fl2000_plane_funcs,
+				       fl2000_pixel_formats, ARRAY_SIZE(fl2000_pixel_formats), NULL,
+				       DRM_PLANE_TYPE_PRIMARY, NULL);
 	if (ret) {
-		dev_err(drm->dev, "Cannot configure simple display pipe (%d)", ret);
+		dev_err(drm->dev, "Cannot initialize primary plane (%d)", ret);
 		return ret;
 	}
+	drm_plane_helper_add(&drm_if->primary, &fl2000_primary_helper_funcs);
+	drm_plane_enable_fb_damage_clips(&drm_if->primary);
+
+	ret = drm_universal_plane_init(drm, &drm_if->cursor, 0, &fl2000_plane_funcs,
+				       fl2000_cursor_formats, ARRAY_SIZE(fl2000_cursor_formats),
+				       NULL, DRM_PLANE_TYPE_CURSOR, NULL);
+	if (ret) {
+		dev_err(drm->dev, "Cannot initialize cursor plane (%d)", ret);
+		return ret;
+	}
+	drm_plane_helper_add(&drm_if->cursor, &fl2000_cursor_helper_funcs);
+
+	ret = drm_crtc_init_with_planes(drm, &drm_if->crtc, &drm_if->primary, &drm_if->cursor,
+					&fl2000_crtc_funcs, NULL);
+	if (ret) {
+		dev_err(drm->dev, "Cannot initialize CRTC (%d)", ret);
+		return ret;
+	}
+	drm_crtc_helper_add(&drm_if->crtc, &fl2000_crtc_helper_funcs);
+
+	ret = drm_simple_encoder_init(drm, &drm_if->encoder, DRM_MODE_ENCODER_NONE);
+	if (ret) {
+		dev_err(drm->dev, "Cannot initialize encoder (%d)", ret);
+		return ret;
+	}
+	drm_if->encoder.possible_crtcs = drm_crtc_mask(&drm_if->crtc);
 
 	/* Register 'mode_set' function to operate prior to bridge */
-	drm_encoder_helper_add(&drm_if->pipe.encoder, &fl2000_encoder_funcs);
+	drm_encoder_helper_add(&drm_if->encoder, &fl2000_encoder_funcs);
 
 	/* Start streaming interface */
-	drm_if->stream = fl2000_stream_create(usb_dev, &drm_if->pipe.crtc);
+	drm_if->stream = fl2000_stream_create(usb_dev, &drm_if->crtc);
 
 	/* Start interrupts interface */
 	drm_if->intr = fl2000_intr_create(usb_dev, drm);
 
 	/* Attach bridge */
-	ret = component_bind_all(master, &drm_if->pipe);
+	ret = component_bind_all(master, &drm_if->encoder);
 	if (ret) {
 		dev_err(drm->dev, "Cannot attach bridge (%d)", ret);
 		return ret;
@@ -706,8 +819,6 @@ int fl2000_drm_bind(struct device *master)
 	 */
 
 	drm_kms_helper_poll_init(drm);
-
-	drm_plane_enable_fb_damage_clips(&drm_if->pipe.plane);
 
 	ret = drm_dev_register(drm, 0);
 	if (ret) {

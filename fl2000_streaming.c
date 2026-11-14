@@ -56,6 +56,15 @@ struct fl2000_stream {
 	 */
 	u32 *conv;
 	size_t conv_size;
+	/* Cursor image (premultiplied ARGB8888) and position, blended into converted lines. Also
+	 * under staging_lock
+	 */
+	u32 *cursor;
+	size_t cursor_alloc;
+	unsigned int cur_w; /* 0 if hidden */
+	unsigned int cur_h;
+	int cur_x;
+	int cur_y;
 	bool dithered; /* dither setting of last_sb's content */
 	struct work_struct work;
 	struct workqueue_struct *work_queue;
@@ -166,6 +175,7 @@ static void fl2000_stream_release(struct device *dev, void *res)
 	fl2000_stream_put_buffers(stream);
 	vfree(stream->staging);
 	vfree(stream->conv);
+	kvfree(stream->cursor);
 }
 
 static void fl2000_stream_data_completion(struct urb *urb)
@@ -264,6 +274,48 @@ static void fl2000_xrgb888_to_rgb565_line(u16 *dbuf, u32 *sbuf, u32 pixels, cons
 	}
 }
 
+/* Premultiplied alpha blending: dst = src + dst * (1 - alpha) */
+static u32 fl2000_blend(u32 dst, u32 src)
+{
+	u32 inv = 255 - (src >> 24);
+	u32 out = 0;
+
+	if (inv == 255)
+		return dst;
+
+	for (int c = 0; c < 24; c += 8) {
+		u32 v = ((src >> c) & 0xFF) + (((dst >> c) & 0xFF) * inv + 127) / 255;
+
+		out |= min_t(u32, v, 0xFF) << c;
+	}
+
+	return out;
+}
+
+/* Blend the cursor into the given screen lines of the conversion copy. Under staging_lock */
+static void fl2000_stream_blend_cursor(struct fl2000_stream *stream, unsigned int y1,
+				       unsigned int y2)
+{
+	const int width = (int)stream->st_width;
+	int x0, x1, cy0, cy1;
+
+	if (!stream->cur_w)
+		return;
+
+	x0 = max(stream->cur_x, 0);
+	x1 = min(stream->cur_x + (int)stream->cur_w, width);
+	cy0 = max(stream->cur_y, (int)y1);
+	cy1 = min(stream->cur_y + (int)stream->cur_h, (int)y2);
+
+	for (int y = cy0; y < cy1; y++) {
+		u32 *dst = stream->conv + (size_t)y * width;
+		const u32 *src = stream->cursor + (size_t)(y - stream->cur_y) * stream->cur_w;
+
+		for (int x = x0; x < x1; x++)
+			dst[x] = fl2000_blend(dst[x], src[x - stream->cur_x]);
+	}
+}
+
 /* Fill a detached buffer with the newest frame: start from the previous frame and convert only
  * the lines changed since, or everything if there is no previous frame in this format
  */
@@ -314,6 +366,7 @@ static void fl2000_stream_fill(struct fl2000_stream *stream, struct fl2000_strea
 	}
 	memcpy((u8 *)stream->conv + y1 * line_len, (u8 *)stream->staging + y1 * line_len,
 	       (y2 - y1) * line_len);
+	fl2000_stream_blend_cursor(stream, y1, y2);
 	stream->dirty_y1 = stream->dirty_y2 = 0;
 
 	mutex_unlock(&stream->staging_lock);
@@ -430,6 +483,23 @@ static void fl2000_stream_work(struct work_struct *work)
 	}
 }
 
+/* Add screen lines [y1, y2) to those the worker converts next. Under staging_lock */
+static void fl2000_stream_dirty(struct fl2000_stream *stream, int y1, int y2)
+{
+	y1 = clamp(y1, 0, (int)stream->st_height);
+	y2 = clamp(y2, 0, (int)stream->st_height);
+	if (y1 >= y2)
+		return;
+
+	if (stream->dirty_y1 >= stream->dirty_y2) {
+		stream->dirty_y1 = y1;
+		stream->dirty_y2 = y2;
+	} else {
+		stream->dirty_y1 = min(stream->dirty_y1, (unsigned int)y1);
+		stream->dirty_y2 = max(stream->dirty_y2, (unsigned int)y2);
+	}
+}
+
 /**
  * fl2000_stream_update() - take over new screen content
  * @stream:	stream
@@ -480,13 +550,53 @@ void fl2000_stream_update(struct fl2000_stream *stream, const void *src, unsigne
 			       line_len);
 	}
 
-	if (stream->dirty_y1 >= stream->dirty_y2) {
-		stream->dirty_y1 = y1;
-		stream->dirty_y2 = y2;
-	} else {
-		stream->dirty_y1 = min(stream->dirty_y1, y1);
-		stream->dirty_y2 = max(stream->dirty_y2, y2);
+	fl2000_stream_dirty(stream, y1, y2);
+out:
+	mutex_unlock(&stream->staging_lock);
+}
+
+/**
+ * fl2000_stream_cursor() - set cursor image and position
+ * @stream:	stream
+ * @src:	premultiplied ARGB8888 image, NULL to hide the cursor
+ * @width:	image width
+ * @height:	image height
+ * @pitch:	image line length in bytes
+ * @x:		position of the top left corner on screen, may be negative
+ * @y:		same, vertical
+ */
+void fl2000_stream_cursor(struct fl2000_stream *stream, const void *src, unsigned int width,
+			  unsigned int height, unsigned int pitch, int x, int y)
+{
+	size_t size = (size_t)width * height * sizeof(u32);
+
+	mutex_lock(&stream->staging_lock);
+
+	/* Old position gets the plain screen content back */
+	if (stream->cur_w)
+		fl2000_stream_dirty(stream, stream->cur_y, stream->cur_y + (int)stream->cur_h);
+	stream->cur_w = 0;
+
+	if (!src || !size)
+		goto out;
+
+	if (stream->cursor_alloc < size) {
+		kvfree(stream->cursor);
+		stream->cursor = kvmalloc(size, GFP_KERNEL);
+		stream->cursor_alloc = stream->cursor ? size : 0;
+		if (!stream->cursor)
+			goto out;
 	}
+
+	for (unsigned int i = 0; i < height; i++)
+		memcpy(stream->cursor + (size_t)i * width, src + (size_t)i * pitch,
+		       width * sizeof(u32));
+
+	stream->cur_w = width;
+	stream->cur_h = height;
+	stream->cur_x = x;
+	stream->cur_y = y;
+	fl2000_stream_dirty(stream, y, y + (int)height);
 out:
 	mutex_unlock(&stream->staging_lock);
 }

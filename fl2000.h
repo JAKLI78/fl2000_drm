@@ -160,6 +160,8 @@ void fl2000_simd_rgb888_line(u8 *dbuf, const u32 *sbuf, u32 pixels);
 #endif
 void fl2000_stream_update(struct fl2000_stream *stream, const void *src, unsigned int width,
 			  unsigned int height, unsigned int pitch, const struct drm_rect *rect);
+void fl2000_stream_cursor(struct fl2000_stream *stream, const void *src, unsigned int width,
+			  unsigned int height, unsigned int pitch, int x, int y);
 int fl2000_stream_enable(struct fl2000_stream *stream);
 void fl2000_stream_disable(struct fl2000_stream *stream);
 
