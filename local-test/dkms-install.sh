@@ -12,8 +12,12 @@ if dkms status -m "$name" -v "$ver" | grep -q .; then
 	dkms remove -m "$name" -v "$ver" --all
 fi
 rm -rf "$src"
-# Older installs loaded it66121 via softdep; it is now loaded by its I2C device alias
-rm -f "$conf"
+# Older installs loaded it66121 via softdep; it is now loaded by its I2C device alias. Keep the
+# rest of the file, such as module options
+if [ -f "$conf" ] && grep -q '^softdep fl2000' "$conf"; then
+	sed -i '/^softdep fl2000/d' "$conf"
+	[ -s "$conf" ] || rm -f "$conf"
+fi
 if [ "${1:-}" = remove ]; then
 	echo "Removed $name $ver"
 	exit 0
